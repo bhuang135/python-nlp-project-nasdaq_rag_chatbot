@@ -1,17 +1,12 @@
-import streamlit as st
 import os
 import sys
-from pathlib import Path
 
-# 將專案中的 src 資料夾加入 Python 搜尋路徑
-PROJECT_ROOT = Path(__file__).resolve().parent
-SRC_DIR = PROJECT_ROOT / "src"
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
 
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-from rag.rag_pipeline import RAGPipeline
-
+import streamlit as st
+from src.rag.rag_pipeline import RAGPipeline
 st.set_page_config(page_title="Nasdaq RAG Chatbot", layout="wide")
 st.title("Nasdaq RAG Chatbot")
 st.caption("Ask about any Nasdaq company using ticker, company name, natural language, or follow-up questions.")
