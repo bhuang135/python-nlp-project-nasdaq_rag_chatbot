@@ -35,7 +35,7 @@ class RAGPipeline:
         collection_name: str = "nasdaq_docs",
         preferred_model: str = "gemini-2.5-flash",
     ):
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = get_gemini_api_key()
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set.")
 
