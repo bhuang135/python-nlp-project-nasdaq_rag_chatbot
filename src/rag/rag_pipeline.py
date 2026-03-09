@@ -11,8 +11,22 @@ from dotenv import load_dotenv
 
 from src.resolver.company_resolver import CompanyResolver
 
+import streamlit as st
+
 load_dotenv()
 
+def get_gemini_api_key():
+    # 1) 先讀 Streamlit secrets
+    if "GEMINI_API_KEY" in st.secrets:
+        return st.secrets["GEMINI_API_KEY"]
+
+    # 2) 再讀環境變數 / .env
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key:
+        return api_key
+
+    # 3) 都沒有才報錯
+    raise ValueError("GEMINI_API_KEY is not set.")
 
 class RAGPipeline:
     def __init__(
