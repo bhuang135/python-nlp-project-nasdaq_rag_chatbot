@@ -544,4 +544,4 @@ def build_index(
 
 if __name__ == "__main__":
     # 初次本機測試建議 20 或 30
-    build_index(limit=30)
+    build_index(limit=500)
