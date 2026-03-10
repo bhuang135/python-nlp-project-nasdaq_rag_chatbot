@@ -1,12 +1,11 @@
 import os
 import sys
+import streamlit as st
+import chromadb
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
     sys.path.append(CURRENT_DIR)
-
-import streamlit as st
-import chromadb
 
 from src.rag.rag_pipeline import RAGPipeline
 from build_index import build_index
@@ -17,14 +16,10 @@ COLLECTION_NAME = "nasdaq_docs"
 
 
 def collection_exists(chroma_dir: str, collection_name: str) -> bool:
-    """
-    檢查指定的 Chroma collection 是否存在。
-    """
     try:
         client = chromadb.PersistentClient(path=chroma_dir)
         collections = client.list_collections()
 
-        # 不同版本 chromadb 可能回傳 object 或 string
         for c in collections:
             if hasattr(c, "name"):
                 if c.name == collection_name:
@@ -34,31 +29,37 @@ def collection_exists(chroma_dir: str, collection_name: str) -> bool:
 
         return False
 
-    except Exception as e:
-        st.warning(f"Failed to check Chroma collection: {e}")
+    except Exception:
         return False
 
 
 def ensure_index():
-    """
-    若 collection 不存在，則建立 index。
-    """
-    if not os.path.exists(CHROMA_DIR):
-        os.makedirs(CHROMA_DIR, exist_ok=True)
+    os.makedirs(CHROMA_DIR, exist_ok=True)
 
     if not collection_exists(CHROMA_DIR, COLLECTION_NAME):
-        with st.spinner("Vector database not found. Building index for first launch..."):
+        with st.spinner("Building vector database for first launch..."):
             build_index(
                 chroma_dir=CHROMA_DIR,
-                collection_name=COLLECTION_NAME
+                collection_name=COLLECTION_NAME,
+                limit=30
             )
-        st.success("Index built successfully.")
 
 
 st.set_page_config(page_title="Nasdaq RAG Chatbot", layout="wide")
-st.title("Nasdaq RAG Chatbot")
-st.write("Ask about any Nasdaq company using ticker, company name, natural language, or follow-up questions.")
 
+st.title("Nasdaq RAG Chatbot")
+st.caption(
+    "Ask about any Nasdaq company using ticker, company name, natural language, or follow-up questions."
+)
+
+# session state
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "current_company" not in st.session_state:
+    st.session_state.current_company = None
+
+# initialize rag
 if "rag" not in st.session_state:
     ensure_index()
     st.session_state.rag = RAGPipeline(
@@ -66,29 +67,8 @@ if "rag" not in st.session_state:
         collection_name=COLLECTION_NAME
     )
 
-query = st.text_input("Enter your question:")
 
-if query:
-    with st.spinner("Thinking..."):
-        answer = st.session_state.rag.answer_question(query)
-    st.write(answer)
-
-
-
-st.set_page_config(page_title="Nasdaq RAG Chatbot", layout="wide")
-st.title("Nasdaq RAG Chatbot")
-st.caption("Ask about any Nasdaq company using ticker, company name, natural language, or follow-up questions.")
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "current_company" not in st.session_state:
-    st.session_state.current_company = None
-
-if "rag" not in st.session_state:
-    st.session_state.rag = RAGPipeline()
-
-query = st.chat_input("Example: Can you summarize AAPL business and financial condition?")
+query = st.chat_input("Example: Compare Apple and Microsoft")
 
 if query:
     st.session_state.history.append(("user", query))
@@ -114,6 +94,7 @@ if query:
                 },
             )
         )
+
     except Exception as e:
         st.session_state.history.append(
             (
@@ -127,10 +108,13 @@ if query:
             )
         )
 
+
 for role, payload in st.session_state.history:
     with st.chat_message(role):
+
         if role == "user":
             st.write(payload)
+
         else:
             st.write(payload["answer"])
 
@@ -143,10 +127,9 @@ for role, payload in st.session_state.history:
 
             citations = payload.get("citations", [])
             if citations:
-                with st.expander("Sources / Citations"):
+                with st.expander("Sources"):
                     for c in citations:
                         st.markdown(
-                            f"**{c['label']}** — {c['company']} ({c['ticker']}) | "
-                            f"{c['source']} | {c['doc_type']} | {c['title']}"
+                            f"**{c['label']}** — {c['company']} ({c['ticker']})"
                         )
                         st.write(c["snippet"])
