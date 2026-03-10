@@ -6,7 +6,7 @@ from chromadb.utils import embedding_functions
 def build_index(
     chroma_dir: str = "chroma_db",
     collection_name: str = "nasdaq_docs",
-    limit: int | None = 100,
+    limit: int | None = 500,
 ):
 
     os.makedirs(chroma_dir, exist_ok=True)
