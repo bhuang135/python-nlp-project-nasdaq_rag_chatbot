@@ -68,7 +68,7 @@ if "rag" not in st.session_state:
     )
 
 
-query = st.chat_input("Example: Compare Apple and Microsoft")
+query = st.chat_input("Example: What is AAPL")
 
 if query:
     st.session_state.history.append(("user", query))
