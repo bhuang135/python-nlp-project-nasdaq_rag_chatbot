@@ -1,5 +1,8 @@
 import os
+import re
+import json
 import chromadb
+
 from google import genai
 from chromadb.utils import embedding_functions
 from rank_bm25 import BM25Okapi
@@ -28,14 +31,12 @@ def get_gemini_api_key():
 
 
 class RAGPipeline:
-
     def __init__(
         self,
         chroma_dir: str = "chroma_db",
         collection_name: str = "nasdaq_docs",
         preferred_model: str = "gemini-2.5-flash",
     ):
-
         api_key = get_gemini_api_key()
 
         self.genai_client = genai.Client(api_key=api_key)
@@ -61,95 +62,595 @@ class RAGPipeline:
         self.resolver = CompanyResolver()
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-    def answer(self, query, conversation_history=None, current_company=None):
-        """
-        Streamlit chat UI 對外統一入口。
-        先做最小可用版本：直接查 collection，取回文件，再交給 Gemini 摘要。
-        """
+        self.compare_patterns = [
+            r"\bcompare\b",
+            r"\bcomparison\b",
+            r"\bversus\b",
+            r"\bvs\.?\b",
+            r"\bwhich company\b",
+            r"\bmore profitable\b",
+            r"\bbetter than\b",
+        ]
 
-        conversation_history = conversation_history or []
+        self.intent_doc_type_map = {
+            "business": {"yf_company_profile", "sec_entity_profile"},
+            "products": {"yf_company_profile", "sec_entity_profile"},
+            "financial": {"sec_companyfacts", "yf_financial_snapshot"},
+            "news": {"yf_news"},
+            "filings": {"sec_recent_filings", "sec_entity_profile", "sec_companyfacts"},
+            "comparison": {"sec_companyfacts", "yf_financial_snapshot", "yf_company_profile"},
+        }
 
-        # 1) 先查向量資料庫
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=3,
-        )
+    # =========================================================
+    # Company understanding
+    # =========================================================
+    def _is_comparison_query(self, query: str) -> bool:
+        q = query.lower()
+        return any(re.search(p, q) for p in self.compare_patterns)
 
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
+    def _find_companies_in_query(self, query: str, current_company: dict | None = None) -> list[dict]:
+        found = []
+        seen = set()
+        comparison_mode = self._is_comparison_query(query)
 
-        # 2) 若查不到資料
-        if not documents:
-            return {
-                "answer": "I could not find relevant information in the current knowledge base.",
-                "citations": [],
-                "company_context": current_company,
-                "model_name": self.model_name,
-            }
+        # 1) Resolver primary path
+        if hasattr(self.resolver, "resolve_many"):
+            try:
+                many = self.resolver.resolve_many(
+                    query,
+                    current_company=current_company,
+                    max_companies=2 if comparison_mode else 1,
+                )
+                for item in many:
+                    if item and item.get("ticker") and item["ticker"] not in seen:
+                        seen.add(item["ticker"])
+                        found.append(item)
 
-        # 3) 建 context
-        context_parts = []
-        citations = []
+                if not comparison_mode and len(found) >= 1:
+                    return found[:1]
+                if comparison_mode and len(found) >= 2:
+                    return found[:2]
+            except Exception:
+                pass
 
-        for idx, doc in enumerate(documents):
-            meta = metadatas[idx] if idx < len(metadatas) else {}
+        # 2) Exact ticker scan
+        ticker_set = getattr(self.resolver, "ticker_set", set())
+        ticker_map = getattr(self.resolver, "ticker_map", {})
 
-            label = f"Source {idx + 1}"
-            company = meta.get("company", "Unknown")
-            ticker = meta.get("ticker", "N/A")
-            source = meta.get("source", "N/A")
-            doc_type = meta.get("doc_type", "N/A")
-            title = meta.get("title", "Untitled")
+        tokens = re.findall(r"\$?[A-Za-z]{1,10}\b", query)
+        for token in tokens:
+            raw = token[1:] if token.startswith("$") else token
+            if raw.isalpha() and raw.isupper() and raw in ticker_set:
+                payload = ticker_map.get(raw)
+                if payload and payload["ticker"] not in seen:
+                    seen.add(payload["ticker"])
+                    found.append(payload)
 
-            context_parts.append(
-                f"[{label}] Company: {company} ({ticker})\nTitle: {title}\nContent: {doc}"
-            )
+        if not comparison_mode and len(found) >= 1:
+            return found[:1]
+        if comparison_mode and len(found) >= 2:
+            return found[:2]
 
-            citations.append(
-                {
-                    "label": label,
-                    "company": company,
-                    "ticker": ticker,
-                    "source": source,
-                    "doc_type": doc_type,
-                    "title": title,
-                    "snippet": doc[:300],
-                }
-            )
+        # 3) Alias scan
+        alias_map = getattr(self.resolver, "alias_map", None)
 
-        context = "\n\n".join(context_parts)
+        if isinstance(alias_map, dict):
+            q_norm = query.lower().strip()
+            matched_aliases = []
 
-        # 4) 呼叫 Gemini
+            for alias, payload in alias_map.items():
+                if not alias or len(alias) < 2:
+                    continue
+
+                pattern = rf"(?<!\w){re.escape(alias)}(?!\w)"
+                if re.search(pattern, q_norm):
+                    matched_aliases.append((len(alias), payload, alias))
+
+            matched_aliases = sorted(matched_aliases, key=lambda x: x[0], reverse=True)
+
+            for _, payload, _alias in matched_aliases:
+                ticker = payload.get("ticker")
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    found.append(
+                        {
+                            "ticker": payload.get("ticker"),
+                            "company": payload.get("company"),
+                        }
+                    )
+
+                if not comparison_mode and len(found) >= 1:
+                    return found[:1]
+                if comparison_mode and len(found) >= 2:
+                    return found[:2]
+
+        # 4) Fallback to current company for follow-up
+        if not found and current_company and not comparison_mode:
+            found.append(current_company)
+
+        return found[:2] if comparison_mode else found[:1]
+
+    def _strip_company_mentions(self, query: str, company_context: dict | None) -> str:
+        if not company_context:
+            q = re.sub(r"\s+", " ", query).strip(" ?,.")
+            return q or "company profile business financial condition"
+
+        q = query
+        ticker = company_context.get("ticker", "")
+        company = company_context.get("company", "")
+
+        patterns = []
+        if ticker:
+            patterns.append(rf"(?<!\w){re.escape(ticker)}(?!\w)")
+        if company:
+            patterns.append(rf"(?<!\w){re.escape(company)}(?!\w)")
+            first_word = company.split()[0]
+            patterns.append(rf"(?<!\w){re.escape(first_word)}(?!\w)")
+
+        for p in patterns:
+            q = re.sub(p, " ", q, flags=re.IGNORECASE)
+
+        q = re.sub(r"\s+", " ", q).strip(" ?,.")
+        return q or "company profile business financial condition"
+
+    # =========================================================
+    # Intent understanding
+    # =========================================================
+    def _infer_intents(self, query: str) -> set[str]:
+        q = query.lower()
+        intents = set()
+
+        if any(x in q for x in ["business model", "business", "overview", "company", "products", "services", "core products", "segments"]):
+            intents.add("business")
+
+        if any(x in q for x in ["products", "services", "core products"]):
+            intents.add("products")
+
+        if any(x in q for x in [
+            "revenue", "net income", "profit", "profitability", "financial",
+            "financial condition", "cash flow", "assets", "liabilities",
+            "balance sheet", "margin", "operating cash flow", "earnings",
+            "market cap", "enterprise value"
+        ]):
+            intents.add("financial")
+
+        if any(x in q for x in ["news", "latest", "recent developments", "recent news", "what is happening"]):
+            intents.add("news")
+
+        if any(x in q for x in ["filing", "filings", "10-k", "10-q", "sec"]):
+            intents.add("filings")
+
+        if self._is_comparison_query(query):
+            intents.add("comparison")
+
+        if not intents:
+            intents.add("business")
+
+        return intents
+
+    # =========================================================
+    # Query rewrite
+    # =========================================================
+    def _safe_parse_queries_from_llm(self, text: str) -> list[str]:
+        if not text:
+            return []
+
+        text = text.strip()
+        text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"^```\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        try:
+            data = json.loads(text)
+            queries = data.get("queries", [])
+            return [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+        except Exception:
+            pass
+
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                queries = data.get("queries", [])
+                return [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+            except Exception:
+                pass
+
+        lines = [x.strip("-• \n\t") for x in text.splitlines() if x.strip()]
+        return [x for x in lines if len(x) > 2][:3]
+
+    def _llm_query_rewrites(self, user_query: str, company_context: dict | None) -> list[str]:
+        company_text = ""
+        if company_context:
+            company_text = f"Target company: {company_context['company']} ({company_context['ticker']})"
+
         prompt = f"""
-You are a financial research assistant.
+Rewrite the user's question into 3 short retrieval queries.
 
-Answer the user's question using ONLY the context below.
-If the context is insufficient, say so clearly.
-Be concise but helpful.
+Rules:
+- Keep each query short and retrieval-friendly.
+- Prefer document-oriented wording like:
+company profile, business overview, products and services,
+revenue, net income, financial snapshot, SEC filings, recent news.
+- If a target company is given, keep all queries tied to that company.
+- Return ONLY valid JSON in this format:
+{{"queries": ["q1", "q2", "q3"]}}
+
+{company_text}
 
 User question:
-{query}
+{user_query}
+""".strip()
 
-Context:
-{context}
-"""
+        try:
+            response = self.genai_client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+            )
+            text = response.text.strip() if hasattr(response, "text") else str(response)
+            return self._safe_parse_queries_from_llm(text)[:3]
+        except Exception:
+            return []
 
+    def generate_queries(self, user_query: str, company_context: dict | None) -> list[str]:
+        focus_query = self._strip_company_mentions(user_query, company_context)
+        intents = self._infer_intents(user_query)
+
+        queries = [user_query.strip(), focus_query]
+
+        if "business" in intents or "products" in intents:
+            queries.extend([
+                "company profile",
+                "business overview",
+                "products and services",
+                "long business summary",
+                "business segments",
+            ])
+
+        if "financial" in intents:
+            queries.extend([
+                "financial snapshot",
+                "sec company facts",
+                "revenue net income assets liabilities equity cash flow",
+                "financial performance",
+                "balance sheet",
+                "profit margins",
+                "market cap enterprise value",
+            ])
+
+        if "news" in intents:
+            queries.extend([
+                "latest news",
+                "recent news",
+                "recent developments",
+                "news digest",
+            ])
+
+        if "filings" in intents:
+            queries.extend([
+                "recent sec filings",
+                "10-k 10-q filings",
+                "sec filings",
+                "sec entity profile",
+                "sec company facts",
+            ])
+
+        if "comparison" in intents:
+            queries.extend([
+                "financial performance comparison",
+                "revenue profitability",
+                "business overview comparison",
+                "market snapshot",
+            ])
+
+        if company_context:
+            ticker = company_context["ticker"]
+            company = company_context["company"]
+
+            queries.extend([
+                f"{company} {focus_query}",
+                f"{ticker} {focus_query}",
+                f"{company} company profile business overview",
+                f"{company} products and services",
+                f"{company} financial snapshot sec company facts",
+                f"{company} recent news",
+                f"{company} sec filings",
+            ])
+        else:
+            queries.extend([
+                f"{focus_query} company profile",
+                f"{focus_query} business overview",
+                f"{focus_query} financial snapshot",
+                f"{focus_query} recent news",
+            ])
+
+        queries.extend(self._llm_query_rewrites(user_query, company_context))
+
+        cleaned = []
+        seen = set()
+        for q in queries:
+            q = re.sub(r"\s+", " ", q).strip()
+            q_norm = q.lower()
+            if q_norm and q_norm not in seen:
+                seen.add(q_norm)
+                cleaned.append(q)
+
+        return cleaned[:15]
+
+    # =========================================================
+    # Retrieval
+    # =========================================================
+    def _raw_vector_search(
+        self,
+        query: str,
+        n_results: int = 20,
+        company_context: dict | None = None,
+    ) -> list[dict]:
+        where_filter = None
+        if company_context:
+            where_filter = {"ticker": company_context["ticker"]}
+
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            where=where_filter,
+        )
+
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        ids = results.get("ids", [[]])[0]
+        distances = results.get("distances", [[]])[0] if "distances" in results else [None] * len(docs)
+
+        output = []
+        for doc, meta, doc_id, dist in zip(docs, metas, ids, distances):
+            output.append(
+                {
+                    "id": doc_id,
+                    "document": doc,
+                    "metadata": meta,
+                    "distance": dist,
+                }
+            )
+        return output
+
+    def _deduplicate_candidates(self, candidates: list[dict]) -> list[dict]:
+        seen = set()
+        unique = []
+        for item in candidates:
+            doc_id = item["id"]
+            if doc_id not in seen:
+                seen.add(doc_id)
+                unique.append(item)
+        return unique
+
+    def _hybrid_rank(
+        self,
+        query: str,
+        candidates: list[dict],
+        final_k: int = 5,
+        intents: set[str] | None = None,
+    ) -> list[dict]:
+        if not candidates:
+            return []
+
+        intents = intents or self._infer_intents(query)
+
+        docs = [c["document"] for c in candidates]
+        tokenized_docs = [re.findall(r"\w+", d.lower()) for d in docs]
+        bm25 = BM25Okapi(tokenized_docs)
+        bm25_scores = bm25.get_scores(re.findall(r"\w+", query.lower()))
+
+        for c, s in zip(candidates, bm25_scores):
+            c["bm25_score"] = float(s)
+
+        preferred_doc_types = set()
+        for intent in intents:
+            preferred_doc_types.update(self.intent_doc_type_map.get(intent, set()))
+
+        def doc_type_boost(x):
+            doc_type = x["metadata"].get("doc_type")
+            return 0.2 if doc_type in preferred_doc_types else 0.0
+
+        def combined_score(x):
+            dist = x["distance"] if x["distance"] is not None else 1.0
+            semantic_score = 1 / (1 + dist)
+            return 0.55 * semantic_score + 0.25 * x["bm25_score"] + doc_type_boost(x)
+
+        coarse = sorted(candidates, key=combined_score, reverse=True)[:25]
+
+        pairs = [(query, c["document"]) for c in coarse]
+        rerank_scores = self.reranker.predict(pairs)
+
+        for c, s in zip(coarse, rerank_scores):
+            c["rerank_score"] = float(s)
+
+        ranked = sorted(coarse, key=lambda x: x["rerank_score"], reverse=True)
+        return ranked[:final_k]
+
+    def hybrid_search(self, query: str, company_context: dict | None, final_k: int = 5) -> list[dict]:
+        query_variants = self.generate_queries(query, company_context)
+        intents = self._infer_intents(query)
+
+        all_candidates = []
+
+        if company_context:
+            for q in query_variants:
+                batch = self._raw_vector_search(q, n_results=20, company_context=company_context)
+                all_candidates.extend(batch)
+
+        global_queries = query_variants[:6]
+        for q in global_queries:
+            batch = self._raw_vector_search(q, n_results=10, company_context=None)
+            all_candidates.extend(batch)
+
+        candidates = self._deduplicate_candidates(all_candidates)
+
+        return self._hybrid_rank(
+            query=query,
+            candidates=candidates,
+            final_k=final_k,
+            intents=intents,
+        )
+
+    def _comparison_search(self, query: str, companies: list[dict], final_k: int = 5) -> list[dict]:
+        merged = []
+
+        for company_context in companies[:2]:
+            partial = self.hybrid_search(
+                query=query,
+                company_context=company_context,
+                final_k=max(final_k, 6),
+            )
+            merged.extend(partial)
+
+        for q in self.generate_queries(query, None)[:6]:
+            merged.extend(self._raw_vector_search(q, n_results=10, company_context=None))
+
+        merged = self._deduplicate_candidates(merged)
+
+        return self._hybrid_rank(
+            query=query,
+            candidates=merged,
+            final_k=final_k,
+            intents={"comparison", "financial", "business"},
+        )
+
+    # =========================================================
+    # Prompt / generation
+    # =========================================================
+    def build_prompt(
+        self,
+        user_query: str,
+        retrieved_chunks: list[dict],
+        conversation_history: list[tuple[str, str]] | None,
+        company_context: dict | None,
+    ) -> str:
+        history_text = ""
+        if conversation_history:
+            trimmed = conversation_history[-10:]
+            history_text = "\n".join([f"{role.upper()}: {msg}" for role, msg in trimmed])
+
+        company_text = ""
+        if company_context:
+            company_text = f"Resolved company: {company_context['company']} ({company_context['ticker']})"
+
+        context_blocks = []
+        for idx, item in enumerate(retrieved_chunks, start=1):
+            meta = item["metadata"]
+            context_blocks.append(
+                f"[S{idx}]\n"
+                f"Ticker: {meta.get('ticker')}\n"
+                f"Company: {meta.get('company')}\n"
+                f"Source: {meta.get('source')}\n"
+                f"Doc Type: {meta.get('doc_type')}\n"
+                f"Title: {meta.get('title')}\n"
+                f"Content:\n{item['document']}\n"
+            )
+
+        context_text = "\n\n".join(context_blocks)
+
+        return f"""
+You are a grounded financial chatbot for Nasdaq listed companies.
+
+Rules:
+1. Answer ONLY from retrieved context.
+2. Never invent facts, numbers, products, events, or assumptions.
+3. If evidence is insufficient, say exactly:
+   "I don't have enough information in the retrieved documents to answer that."
+4. Use inline citations like [S1], [S2].
+5. Use conversation history only to understand follow-up questions, not as factual evidence.
+6. If the question is comparative, compare only what is supported by the retrieved context.
+7. Prefer SEC companyfacts over Yahoo summaries when both exist and conflict.
+8. Keep the answer factual, structured, and concise.
+
+{company_text}
+
+Conversation history:
+{history_text}
+
+Retrieved context:
+{context_text}
+
+User question:
+{user_query}
+
+Write:
+- Direct answer
+- Optional bullet summary
+- Final line: Sources Used: [S1], [S2], ...
+""".strip()
+
+    def _generate_answer(self, prompt: str) -> str:
         response = self.genai_client.models.generate_content(
             model=self.model_name,
             contents=prompt,
         )
+        return response.text.strip()
 
-        answer_text = response.text if hasattr(response, "text") else str(response)
+    # =========================================================
+    # Main
+    # =========================================================
+    def answer(self, query, conversation_history=None, current_company=None):
+        conversation_history = conversation_history or []
 
-        # 5) 嘗試從 citation metadata 帶出 company context
-        company_context = current_company
-        if metadatas:
-            first_meta = metadatas[0]
-            if first_meta.get("company") and first_meta.get("ticker"):
-                company_context = {
-                    "company": first_meta.get("company"),
-                    "ticker": first_meta.get("ticker"),
+        companies = self._find_companies_in_query(query, current_company=current_company)
+        print("DEBUG companies found:", companies)
+
+        if not self._is_comparison_query(query):
+            company_context = companies[0] if companies else None
+            retrieved = self.hybrid_search(
+                query=query,
+                company_context=company_context,
+                final_k=6,
+            )
+        else:
+            company_context = companies[0] if companies else None
+
+            if len(companies) >= 2:
+                retrieved = self._comparison_search(
+                    query=query,
+                    companies=companies,
+                    final_k=6,
+                )
+            else:
+                print("DEBUG comparison fallback triggered; companies found:", companies)
+                retrieved = self.hybrid_search(
+                    query=query,
+                    company_context=None,
+                    final_k=6,
+                )
+
+        if not retrieved:
+            return {
+                "answer": "I couldn't retrieve any relevant documents from the vector database.",
+                "citations": [],
+                "company_context": company_context,
+                "model_name": self.model_name,
+            }
+
+        prompt = self.build_prompt(
+            user_query=query,
+            retrieved_chunks=retrieved,
+            conversation_history=conversation_history,
+            company_context=company_context,
+        )
+
+        answer_text = self._generate_answer(prompt)
+
+        citations = []
+        for idx, item in enumerate(retrieved, start=1):
+            meta = item["metadata"]
+            citations.append(
+                {
+                    "label": f"S{idx}",
+                    "ticker": meta.get("ticker"),
+                    "company": meta.get("company"),
+                    "source": meta.get("source"),
+                    "doc_type": meta.get("doc_type"),
+                    "title": meta.get("title"),
+                    "snippet": item["document"][:320] + ("..." if len(item["document"]) > 320 else ""),
                 }
+            )
 
         return {
             "answer": answer_text,
