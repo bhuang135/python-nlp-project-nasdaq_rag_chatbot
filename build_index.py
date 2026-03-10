@@ -10,6 +10,52 @@ import chromadb
 from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 
+
+def build_index(chroma_dir: str = "chroma_db", collection_name: str = "nasdaq_docs"):
+    """
+    建立或重建 Chroma collection。
+    你要把原本本機可跑的 indexing 流程搬進來。
+    """
+    os.makedirs(chroma_dir, exist_ok=True)
+
+    client = chromadb.PersistentClient(path=chroma_dir)
+
+    # 如果同名 collection 已存在，可選擇先刪掉再重建
+    existing = [c.name if hasattr(c, "name") else c for c in client.list_collections()]
+    if collection_name in existing:
+        client.delete_collection(name=collection_name)
+
+    collection = client.create_collection(name=collection_name)
+
+    # =========================
+    # 這裡放你原本的資料處理流程
+    # 例如：
+    # 1. 讀取 Nasdaq dataset
+    # 2. chunk documents
+    # 3. 產 embeddings
+    # 4. add to collection
+    # =========================
+
+    documents = [
+        "Apple Inc. designs consumer electronics and software.",
+        "Microsoft Corporation provides cloud services and enterprise software.",
+        "NVIDIA focuses on GPUs, AI computing, and accelerated computing platforms."
+    ]
+    ids = ["doc1", "doc2", "doc3"]
+    metadatas = [
+        {"company": "Apple"},
+        {"company": "Microsoft"},
+        {"company": "NVIDIA"}
+    ]
+
+    collection.add(
+        documents=documents,
+        ids=ids,
+        metadatas=metadatas
+    )
+
+    print(f"Collection '{collection_name}' built successfully at '{chroma_dir}'.")
+
 load_dotenv()
 
 CHROMA_DIR = "chroma_db"
@@ -554,4 +600,4 @@ def build_index(limit: int | None = None) -> None:
 if __name__ == "__main__":
     # 正式跑全量請改成 None
     # 初次測試建議 200 或 300
-    build_index(limit=None)
+    build_index(limit=100)
