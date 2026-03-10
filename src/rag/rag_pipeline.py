@@ -63,55 +63,97 @@ class RAGPipeline:
 
     def answer(self, query, conversation_history=None, current_company=None):
         """
-        Streamlit chat UI 用的統一介面。
-        若原本專案主方法叫 answer_question()，這裡做一層包裝。
+        Streamlit chat UI 對外統一入口。
+        先做最小可用版本：直接查 collection，取回文件，再交給 Gemini 摘要。
         """
-    
+
         conversation_history = conversation_history or []
-    
-        # 情況 1：如果你原本有 answer_question()
-        if hasattr(self, "answer_question"):
-            raw = self.answer_question(query)
-    
-            # 若原本只回傳字串，包成前端需要的格式
-            if isinstance(raw, str):
-                return {
-                    "answer": raw,
-                    "citations": [],
-                    "company_context": current_company,
-                    "model_name": getattr(self, "model_name", None),
-                }
-    
-            # 若原本已經是 dict，就補齊欄位
-            if isinstance(raw, dict):
-                return {
-                    "answer": raw.get("answer", ""),
-                    "citations": raw.get("citations", []),
-                    "company_context": raw.get("company_context", current_company),
-                    "model_name": raw.get("model_name", getattr(self, "model_name", None)),
-                }
-    
-        # 情況 2：如果你原本有 ask()
-        if hasattr(self, "ask"):
-            raw = self.ask(query)
-    
-            if isinstance(raw, str):
-                return {
-                    "answer": raw,
-                    "citations": [],
-                    "company_context": current_company,
-                    "model_name": getattr(self, "model_name", None),
-                }
-    
-            if isinstance(raw, dict):
-                return {
-                    "answer": raw.get("answer", ""),
-                    "citations": raw.get("citations", []),
-                    "company_context": raw.get("company_context", current_company),
-                    "model_name": raw.get("model_name", getattr(self, "model_name", None)),
-                }
-    
-        raise AttributeError(
-            "RAGPipeline has neither 'answer()', 'answer_question()', nor 'ask()'. "
-            "Please expose one main response method."
+
+        # 1) 先查向量資料庫
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=3,
         )
+
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+
+        # 2) 若查不到資料
+        if not documents:
+            return {
+                "answer": "I could not find relevant information in the current knowledge base.",
+                "citations": [],
+                "company_context": current_company,
+                "model_name": self.model_name,
+            }
+
+        # 3) 建 context
+        context_parts = []
+        citations = []
+
+        for idx, doc in enumerate(documents):
+            meta = metadatas[idx] if idx < len(metadatas) else {}
+
+            label = f"Source {idx + 1}"
+            company = meta.get("company", "Unknown")
+            ticker = meta.get("ticker", "N/A")
+            source = meta.get("source", "N/A")
+            doc_type = meta.get("doc_type", "N/A")
+            title = meta.get("title", "Untitled")
+
+            context_parts.append(
+                f"[{label}] Company: {company} ({ticker})\nTitle: {title}\nContent: {doc}"
+            )
+
+            citations.append(
+                {
+                    "label": label,
+                    "company": company,
+                    "ticker": ticker,
+                    "source": source,
+                    "doc_type": doc_type,
+                    "title": title,
+                    "snippet": doc[:300],
+                }
+            )
+
+        context = "\n\n".join(context_parts)
+
+        # 4) 呼叫 Gemini
+        prompt = f"""
+You are a financial research assistant.
+
+Answer the user's question using ONLY the context below.
+If the context is insufficient, say so clearly.
+Be concise but helpful.
+
+User question:
+{query}
+
+Context:
+{context}
+"""
+
+        response = self.genai_client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+        )
+
+        answer_text = response.text if hasattr(response, "text") else str(response)
+
+        # 5) 嘗試從 citation metadata 帶出 company context
+        company_context = current_company
+        if metadatas:
+            first_meta = metadatas[0]
+            if first_meta.get("company") and first_meta.get("ticker"):
+                company_context = {
+                    "company": first_meta.get("company"),
+                    "ticker": first_meta.get("ticker"),
+                }
+
+        return {
+            "answer": answer_text,
+            "citations": citations,
+            "company_context": company_context,
+            "model_name": self.model_name,
+        }
