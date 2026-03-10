@@ -60,3 +60,58 @@ class RAGPipeline:
 
         self.resolver = CompanyResolver()
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+    def answer(self, query, conversation_history=None, current_company=None):
+        """
+        Streamlit chat UI 用的統一介面。
+        若原本專案主方法叫 answer_question()，這裡做一層包裝。
+        """
+    
+        conversation_history = conversation_history or []
+    
+        # 情況 1：如果你原本有 answer_question()
+        if hasattr(self, "answer_question"):
+            raw = self.answer_question(query)
+    
+            # 若原本只回傳字串，包成前端需要的格式
+            if isinstance(raw, str):
+                return {
+                    "answer": raw,
+                    "citations": [],
+                    "company_context": current_company,
+                    "model_name": getattr(self, "model_name", None),
+                }
+    
+            # 若原本已經是 dict，就補齊欄位
+            if isinstance(raw, dict):
+                return {
+                    "answer": raw.get("answer", ""),
+                    "citations": raw.get("citations", []),
+                    "company_context": raw.get("company_context", current_company),
+                    "model_name": raw.get("model_name", getattr(self, "model_name", None)),
+                }
+    
+        # 情況 2：如果你原本有 ask()
+        if hasattr(self, "ask"):
+            raw = self.ask(query)
+    
+            if isinstance(raw, str):
+                return {
+                    "answer": raw,
+                    "citations": [],
+                    "company_context": current_company,
+                    "model_name": getattr(self, "model_name", None),
+                }
+    
+            if isinstance(raw, dict):
+                return {
+                    "answer": raw.get("answer", ""),
+                    "citations": raw.get("citations", []),
+                    "company_context": raw.get("company_context", current_company),
+                    "model_name": raw.get("model_name", getattr(self, "model_name", None)),
+                }
+    
+        raise AttributeError(
+            "RAGPipeline has neither 'answer()', 'answer_question()', nor 'ask()'. "
+            "Please expose one main response method."
+        )
