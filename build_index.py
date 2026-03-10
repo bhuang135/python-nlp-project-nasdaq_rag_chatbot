@@ -452,7 +452,7 @@ def reset_collection(client: chromadb.PersistentClient, collection_name: str) ->
 def build_index(
     chroma_dir: str = "chroma_db",
     collection_name: str = "nasdaq_docs",
-    limit: int | None = 30,
+    limit: int | None = 500,
 ) -> None:
     """
     Streamlit / GitHub deploy friendly version:
