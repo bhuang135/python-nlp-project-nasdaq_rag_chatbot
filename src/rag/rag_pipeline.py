@@ -560,8 +560,7 @@ Rules:
 4. Use inline citations like [S1], [S2].
 5. Use conversation history only to understand follow-up questions, not as factual evidence.
 6. If the question is comparative, compare only what is supported by the retrieved context.
-7. Prefer SEC companyfacts over Yahoo summaries when both exist and conflict.
-8. Keep the answer factual, structured, and concise.
+7. Keep the answer factual, structured, and concise.
 
 {company_text}
 
